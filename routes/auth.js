@@ -36,90 +36,110 @@ router.post(
 
     try {
       conn = await pool.getConnection();
+
+      // Check if the email already exists in the database
+      const [existingUser] = await conn.query(
+        'SELECT * FROM users WHERE email = ?',
+        [email]
+      );
+
+      if (existingUser?.length > 0) {
+        return res.status(400).json({ message: 'Email already in use' });
+      }
+
+      // Hash password before storing
       const hashedPassword = await bcrypt.hash(password, 10);
 
-      // Insert user into the database
+      // Insert the new user into the database
       await conn.query(
         'INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)',
         [username, hashedPassword, email, role]
       );
 
-      res.status(201).json({ message: 'User created' });
+      res.status(201).json({ message: 'User created successfully' });
     } catch (err) {
-      console.error(err);
+
+      console.error(err.message);
+      if (err.message.includes('Duplicate entry')) {
+        return res.status(400).json({ message: 'Email already in use' });
+      }
+
       res.status(500).json({ message: 'Internal server error' });
+
     } finally {
-        if (conn) conn.release();// Ensure the connection is released
+
+      if (conn) conn.release(); // Ensure the connection is released
+
     }
   }
 );
 
 // User login route
-router.post('/login', loginLimiter , 
+router.post('/login', loginLimiter,
   [
-  body('username').isLength({ min: 3 }).trim().escape(),
-  body('password').isLength({ min: 6 }).trim().escape()
+    body('username').isLength({ min: 3 }).trim().escape(),
+    body('password').isLength({ min: 6 }).trim().escape()
   ], async (req, res) => {
 
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
-  }
-
-  const { username, password } = req.body;
-  let conn;
-
-  try {
-    conn = await pool.getConnection();
-    const [user] = await conn.query('SELECT * FROM users WHERE username = ? or email = ?', [username, username]);
-
-
-    if (!user) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
+    const { username, password } = req.body;
+    let conn;
 
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid credentials' });
-    }
+    try {
+      conn = await pool.getConnection();
+      const [user] = await conn.query('SELECT * FROM users WHERE username = ? or email = ?', [username, username]);
 
-    // Create JWT tokens (access and refresh)
-    const accessToken = jwt.sign(
+
+      if (!user) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      const isMatch = await bcrypt.compare(password, user?.password);
+
+      if (!isMatch) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      // Create JWT tokens (access and refresh)
+      const accessToken = jwt.sign(
         { username: user.username, role: user.role },   // Payload
         process.env.SECRET_KEY,                          // Secret key
-        { expiresIn: '1h' }                             // Options (expires in 1 hour)
+        { expiresIn: '15m' }                             // Options (expires in 1 hour)
       );
-      
+
       // Generate refresh token
       const refreshToken = jwt.sign(
         { username: user.username, role: user.role },   // Payload
         process.env.SECRET_KEY,                          // Secret key
         { expiresIn: '7d' }                             // Options (expires in 7 days)
       );
-      
-    // Store refresh token in the database
-    await conn.query('UPDATE users SET refresh_token = ? WHERE id = ?', [refreshToken, user.id]);
 
-    res
-      .cookie('refreshToken', refreshToken, {
-        httpOnly: true,
-        secure: true, // Only in HTTPS
-        sameSite: 'Strict',
-      })
-      .json({ accessToken });
+      // Store refresh token in the database
+      await conn.query('UPDATE users SET refresh_token = ? WHERE id = ?', [refreshToken, user.id]);
+      const info = { id: user?.id, name: user?.username, email: user?.email }
+      res
+        .cookie('refreshToken', refreshToken, {
+          httpOnly: true,
+          secure: true, // Only in HTTPS
+          sameSite: 'Strict',
+        })
+        .json({ accessToken, info });
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Internal server error' });
-  } finally {
-    if (conn) conn.release();// Ensure the connection is released
-  }
-});
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: 'Internal server error' });
+    } finally {
+      if (conn) conn.release();// Ensure the connection is released
+    }
+  });
 
 // Refresh token route
 router.post('/refresh-token', async (req, res) => {
-  const { refreshToken } = req.body;
+  const refreshToken = req.cookies.refreshToken;  // Get refresh token from cookies
 
   if (!refreshToken) {
     return res.status(400).json({ message: 'Refresh token required' });
@@ -135,11 +155,10 @@ router.post('/refresh-token', async (req, res) => {
     }
 
     const decoded = jwt.decode(refreshToken, process.env.SECRET_KEY);
-    const newAccessToken = jwt.encode(
+    const newAccessToken = jwt.sign(
       { username: decoded.username, role: decoded.role },
       process.env.SECRET_KEY,
-      'HS256',
-      { expiresIn: '1h' }
+      { expiresIn: '15m' }
     );
 
     res.json({ accessToken: newAccessToken });
@@ -150,15 +169,26 @@ router.post('/refresh-token', async (req, res) => {
   }
 });
 
+// Logout Route
+router.post('/logout', (req, res) => {
+  const { refreshToken } = req.cookies;
+
+  // Invalidate the refresh token
+  const user = users.find((u) => u.refreshToken === refreshToken);
+  if (user) user.refreshToken = null;
+
+  res.clearCookie('refreshToken').json({ message: 'Logged out' });
+});
+
 // Admin protected route
 router.get('/admin', authMiddleware, roleMiddleware('admin'), (req, res) => {
-    try{
+  try {
     res.json({ message: 'Welcome to the admin panel!' });
-    }catch(err){
-        console.log(err)
-    }finally{
-        if (conn) conn.release();
-    }
+  } catch (err) {
+    console.log(err)
+  } finally {
+    if (conn) conn.release();
+  }
 });
 
 // User protected route
